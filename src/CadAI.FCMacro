@@ -1,0 +1,787 @@
+"""
+CadAI Macro
+======================================
+CadAI is an AI-powered text-to-CAD tool designed to streamline CAD workflows by enabling natural language-driven design. This macro integrates with the OpenAI API to provide intelligent CAD model generation.
+
+License
+-------
+This software is released under the MIT License. You are free to use, modify,
+and distribute this software, provided you include this license notice and give
+credit to the original author.
+
+How to Use
+----------
+1. Load this macro in FreeCAD.
+2. Configure your OpenAI API key as an environment variable:
+  - `export OPENAI_API_KEY="your-api-key"`
+3. Run the macro in FreeCAD and interact via the chat interface.
+
+Credits
+-------
+- Artifex Development Team
+- Powered by OpenAI API (https://openai.com/)
+
+DISCLAIMER: This software is provided "as is", without warranty of any kind.
+
+Copyright (c) 2025 Islam Nurdin
+"""
+
+from PySide import QtGui, QtCore
+from openai import OpenAI
+import os
+import re
+import base64
+import json
+from pygments import highlight
+from pygments.lexers import PythonLexer
+from pygments.formatters import HtmlFormatter
+import FreeCAD, Part
+import FreeCADGui
+
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+CODE_BLOCK = re.compile(r"```python(.*?)```", re.S)
+PY_FORMATTER = HtmlFormatter(noclasses=True, nowrap=True, style="monokai")
+
+SPINNER_DATA = {}
+try:
+    with open(
+        os.path.join(os.path.dirname(__file__), "spinners.json"),
+        "r",
+        encoding="utf-8",
+    ) as f:
+        SPINNER_DATA = json.load(f)
+except Exception as e:
+    print("Failed to load spinner definitions:", e)
+
+
+class OpenAIWorker(QtCore.QThread):
+    result_ready = QtCore.Signal(str)
+    error = QtCore.Signal(str)
+
+    def __init__(self, system_message, user_message, image_path=None):
+        super(OpenAIWorker, self).__init__()
+        self.system_message = system_message
+        self.user_message = user_message
+        self.image_path = image_path
+
+    def encode_image(self, path):
+        with open(path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+
+    def run(self):
+        try:
+            # If an image was provided → use vision API
+            if self.image_path:
+                image_b64 = self.encode_image(self.image_path)
+
+                response = client.responses.create(
+                    model="gpt-4.1-mini",
+                    input=[
+                        {"role": "system", "content": self.system_message},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": self.user_message},
+                                {
+                                    "type": "input_image",
+                                    "image_url": f"data:image/png;base64,{image_b64}",
+                                },
+                            ],
+                        },
+                    ],
+                )
+
+                text = response.output_text
+
+            # No image → normal chat
+            else:
+                response = client.chat.completions.create(
+                    model="gpt-4.1-mini",
+                    messages=[
+                        {"role": "system", "content": self.system_message},
+                        {"role": "user", "content": self.user_message},
+                    ],
+                    temperature=0.1,
+                )
+
+                text = response.choices[0].message.content.strip()
+
+            self.result_ready.emit(text)
+
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class RegistryButton(QtGui.QPushButton):
+    def __init__(self, registry_json, parent=None):
+        super().__init__("Registry", parent)
+        self.registry_json = registry_json
+        self.setStyleSheet(
+            """
+            QPushButton {
+                background:#333;
+                color:#AAA;
+                border:1px solid #555;
+                border-radius:4px;
+                padding:4px 8px;
+            }
+            QPushButton:hover {
+                background:#444;
+            }
+        """
+        )
+        self.clicked.connect(self.show_registry)
+
+    def show_registry(self):
+        dlg = QtGui.QDialog(self)
+        dlg.setWindowTitle("AI Registry Snapshot")
+        dlg.resize(600, 500)
+
+        layout = QtGui.QVBoxLayout(dlg)
+        view = QtGui.QTextEdit()
+        view.setReadOnly(True)
+        view.setStyleSheet("background:#111; color:#DDD; font-family:Consolas;")
+
+        # Colorize JSON
+        pretty = json.dumps(json.loads(self.registry_json), indent=2)
+        dock = self.parent()
+
+        while dock and not hasattr(dock, "colorize_json"):
+            dock = dock.parent()
+
+        html = dock.colorize_json(pretty)
+
+        view.setHtml(html)
+        layout.addWidget(view)
+        dlg.exec_()
+
+
+class ChatDock(QtGui.QDockWidget):
+    def __init__(self, parent=None):
+        super(ChatDock, self).__init__("AI Chat", parent)
+        self.setAllowedAreas(
+            QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea
+        )
+
+        self.registry_snapshots = {}  # message_id -> registry json
+        self.user_message_counter = 0
+
+        # Central widget
+        widget = QtGui.QWidget()
+        layout = QtGui.QVBoxLayout()
+
+        # Chat display
+        self.chat_display = QtGui.QTextEdit()
+        self.chat_display.setReadOnly(True)
+        self.chat_display.setAcceptRichText(True)
+        self.chat_display.viewport().installEventFilter(self)
+
+        self.button_overlay = QtGui.QWidget(self.chat_display.viewport())
+        self.button_overlay.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, False)
+        self.button_overlay.setAttribute(QtCore.Qt.WA_NoSystemBackground, True)
+        self.button_overlay.setStyleSheet("background: transparent;")
+        self.button_overlay.show()
+
+        self.registry_buttons = []
+
+        self.chat_display.verticalScrollBar().valueChanged.connect(
+            self.reposition_registry_buttons
+        )
+        self.chat_display.textChanged.connect(self.reposition_registry_buttons)
+
+        # Increase chat font size
+        font = self.chat_display.font()
+        font.setPointSize(24)  # adjust to 12–15 as you prefer
+        self.chat_display.setFont(font)
+
+        self.ai_step_counter = 0
+        self.ai_steps = []  # (step_id, full_text, code, transaction_name)
+
+        self.styles = {
+            "user_label": "#4FA3FF",  # Blue
+            "assistant_label": "#00C896",  # Green
+            "error": "#FF5555",
+            "text": "#FFFFFF",
+            "separator": "#444444",
+        }
+
+        layout.addWidget(self.chat_display)
+
+        # Input field
+        self.chat_input = QtGui.QTextEdit()
+        self.chat_input.setFixedHeight(80)
+        self.chat_input.setPlaceholderText(
+            "Describe what you want to create or modify..."
+        )
+        layout.addWidget(self.chat_input)
+
+        # Buttons row
+        button_row = QtGui.QHBoxLayout()
+
+        button_row.addStretch()
+
+        # --- AI loading spinner ---
+        self.spinner_text = "Thinking"
+        self.active_spinner_name = "dots"  # default; changeable
+        self.active_spinner_frames = SPINNER_DATA.get(self.active_spinner_name, {}).get(
+            "frames", ["•"]
+        )
+        self.active_spinner_interval = SPINNER_DATA.get(
+            self.active_spinner_name, {}
+        ).get("interval", 100)
+        self._spinner_index = 0
+
+        self.spinner_label = QtGui.QLabel("")
+        self.spinner_label.setStyleSheet("color:#AAA; font-size:16px;")
+        self.spinner_label.setVisible(False)
+        button_row.addWidget(self.spinner_label)
+
+        self._spinner_timer = QtCore.QTimer()
+        self._spinner_timer.timeout.connect(self._advance_spinner)
+
+        self.reference_image = None
+        self.image_button = QtGui.QPushButton("Add Image")
+        self.image_button.clicked.connect(self.load_reference_image)
+        button_row.addWidget(self.image_button)
+
+        self.undo_ai_btn = QtGui.QPushButton("Undo ⟲")
+        self.undo_ai_btn.setToolTip("Undo last AI action")
+        self.undo_ai_btn.clicked.connect(self.undo_ai)
+        button_row.addWidget(self.undo_ai_btn)
+
+        self.redo_ai_btn = QtGui.QPushButton("Redo ⟳")
+        self.redo_ai_btn.setToolTip("Redo last AI action")
+        self.redo_ai_btn.clicked.connect(self.redo_ai)
+        button_row.addWidget(self.redo_ai_btn)
+
+        self.send_button = QtGui.QPushButton("Send")
+        self.send_button.clicked.connect(self.send_message)
+        button_row.addWidget(self.send_button)
+
+        layout.addLayout(button_row)
+
+        widget.setLayout(layout)
+        self.setWidget(widget)
+        self.message_history = []
+
+        self.image_preview = QtGui.QLabel()
+        self.image_preview.setFixedHeight(240)
+        self.image_preview.setAlignment(QtCore.Qt.AlignCenter)
+        self.image_preview.setStyleSheet(
+            "border:1px solid #444; background:#222; padding:4px;"
+        )
+        layout.addWidget(self.image_preview)
+        self.image_preview.setVisible(False)
+
+    def _advance_spinner(self):
+        frames = self.active_spinner_frames
+        if not frames:
+            return
+        self._spinner_index = (self._spinner_index + 1) % len(frames)
+        frame = frames[self._spinner_index]
+        # self.spinner_label.setText(frames[self._spinner_index])
+        self.spinner_label.setText(f"{self.spinner_text} {frame}")
+
+    def eventFilter(self, obj, event):
+        if (
+            obj == self.chat_display.viewport()
+            and event.type() == QtCore.QEvent.MouseButtonRelease
+        ):
+            cursor = self.chat_display.cursorForPosition(event.pos())
+            cursor.select(QtGui.QTextCursor.BlockUnderCursor)
+            block = cursor.block().text()
+
+            if "AI Step" in block:
+                try:
+                    step = int(block.split("AI Step")[1].split(":")[0].strip())
+                    self.rollback_to_step(step)
+                except:
+                    pass
+        return False
+
+    def rollback_to_step(self, step_id):
+        doc = FreeCAD.ActiveDocument
+        if not doc:
+            return
+
+        while self.ai_steps and self.ai_steps[-1][0] > step_id:
+            _, _, _, tx = self.ai_steps.pop()
+            doc.undo()
+
+        doc.recompute()
+
+    def undo_ai(self):
+        doc = FreeCAD.ActiveDocument
+        if doc:
+            doc.undo()
+            doc.recompute()
+            self.append_chat("System", "Undo")
+
+    def redo_ai(self):
+        doc = FreeCAD.ActiveDocument
+        if doc:
+            doc.redo()
+            doc.recompute()
+            self.append_chat("System", "Redo")
+
+    def clear_image(self):
+        self.reference_image = None
+        self.image_preview.clear()
+        self.image_preview.setVisible(False)
+
+    def load_reference_image(self):
+        self.clear_image()
+        path = self.pick_image_file()
+        if not path:
+            return
+
+        self.reference_image = path
+        self.append_chat("System", f"Loaded reference image: {path}")
+
+        pixmap = QtGui.QPixmap(path)
+        if pixmap.isNull():
+            self.append_chat("Error", "Could not load image")
+            return
+
+        scaled = pixmap.scaled(
+            self.image_preview.width(),
+            self.image_preview.height(),
+            QtCore.Qt.KeepAspectRatio,
+            QtCore.Qt.SmoothTransformation,
+        )
+
+        self.image_preview.setPixmap(scaled)
+        self.image_preview.setVisible(True)
+
+    def pick_image_file(self):
+        path, _ = QtGui.QFileDialog.getOpenFileName(
+            None, "Select reference image", "", "Images (*.png *.jpg *.jpeg *.bmp)"
+        )
+        return path
+
+    def html_escape(self, text):
+        return (
+            text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+            .replace("'", "&#39;")
+        )
+
+    def reposition_registry_buttons(self):
+        viewport = self.chat_display.viewport()
+
+        for btn, block in self.registry_buttons:
+            cursor = QtGui.QTextCursor(block)
+            rect = self.chat_display.cursorRect(cursor)
+
+            # Top-right corner of the message block
+            x = viewport.width() - btn.width() - 10
+            y = rect.top() + 4
+
+            btn.move(x, y)
+
+    def append_chat(self, role, text, step_id=None):
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.End)
+
+        if role == "Error":
+            color = "#E53E3E"  # red
+            name = "Error"
+        elif role == "System":
+            color = "#8C2BB0"
+            name = "System"
+        elif role == "User":
+            color = "#2B6CB0"
+            name = "You"
+        else:
+            color = "#2F855A"
+            name = "AI"
+
+        formatted_text = self.format_blocks(text)
+        step_label = f'data-step="{step_id}"' if step_id else ""
+        stepSpan = (
+            f'<span style="color:{color}; font-weight:bold;">AI Step: {step_id}</span>'
+            if step_id
+            else ""
+        )
+
+        html = f"""
+          <hr style="border-top:1px solid {self.styles['separator']}; margin:6px 0;">
+          <div style="margin-top:10px;" {step_label}>
+              <span style="color:{color}; font-weight:bold;">{name}:</span>
+              {stepSpan}
+              <div style="font-size: 16px;">
+                  {formatted_text}
+              </div>
+          </div>
+          """
+
+        start_block = cursor.block()
+
+        cursor.insertHtml(html)
+
+        end_block = self.chat_display.textCursor().block()
+
+        if role == "User" and hasattr(self, "last_user_registry"):
+            btn = RegistryButton(self.last_user_registry, self.button_overlay)
+            btn.show()
+            self.registry_buttons.append((btn, end_block))
+            self.reposition_registry_buttons()
+
+        self.chat_display.setTextCursor(cursor)
+        self.chat_display.ensureCursorVisible()
+
+    def format_blocks(self, text):
+        # Split AI response into code blocks and normal text
+        parts = re.split(r"```python\s*(.*?)```", text, flags=re.S | re.I)
+        out = ""
+
+        for i, part in enumerate(parts):
+            if i % 2 == 0:
+                # Normal text outside code blocks
+                safe = self.html_escape(part)
+                safe = safe.replace("\n", "<br>")
+                if safe.strip():
+                    out += f"<div style='color:{self.styles['text']}; white-space:pre-wrap;'>{safe}</div>"
+            else:
+                # Code block: use Pygments to highlight tokens (inline spans), then build lines + numbers
+                code_content = part.rstrip("\n")
+                if code_content.strip() == "":
+                    continue
+
+                # Get tokenized HTML without wrappers
+                highlighted_inline = highlight(
+                    code_content, PythonLexer(), PY_FORMATTER
+                )
+                # highlighted_inline contains inline <span ...> tokens and newline characters
+
+                # Split into lines preserving empty lines
+                lines = highlighted_inline.splitlines()
+                numbered_lines = []
+                for idx, line_html in enumerate(lines, start=1):
+                    # Ensure an empty source line shows as a visible blank
+                    if line_html == "":
+                        line_html = "&nbsp;"
+
+                    # Line number span (grey) + small right padding
+                    lineno_html = (
+                        f"<span style='color:#888; display:inline-block; width:40px; text-align:right; padding-right:18px; "
+                        f"-webkit-user-select:none; user-select:none;'>"
+                        f"{idx}</span>"
+                    )
+
+                    # Wrap the highlighted line (line_html already escaped by Pygments)
+                    numbered_lines.append(lineno_html + line_html)
+
+                # Join with <br> and wrap in a black container that Qt will render properly
+                code_html = "<br>".join(numbered_lines)
+
+                block_html = (
+                    "<div style='background:#000000; padding:10px; border-radius:6px; margin:8px 0; "
+                    'font-family: Consolas, "Courier New", monospace; font-size:14px; line-height:1.4; color:#fff; '
+                    "overflow-x:auto;'>"
+                    f"{code_html}"
+                    "</div>"
+                )
+
+                out += block_html
+
+        return out
+
+    def build_semantic_graph(self):
+        doc = FreeCAD.ActiveDocument
+        registry = {}
+        if not doc:
+            return registry
+
+        for obj in doc.Objects:
+            # Ignore the registry itself or history-only objects
+            if obj.Name == "AI_Registry" or self.is_history_node(obj):
+                continue
+
+            # Boolean result
+            if self.is_boolean(obj):
+                registry[obj.Name] = {
+                    "name": obj.Name,
+                    "type": "boolean",
+                    "children": [],  # will fill later
+                    "properties": {},
+                }
+                continue
+
+            # Solid body or part
+            if self.is_solid_feature(obj):
+                registry[obj.Name] = {
+                    "name": obj.Name,
+                    "type": "solid",
+                    "children": [],
+                    "position": self.get_global_position(obj),
+                    "color": self.get_color(obj),
+                    "properties": {},
+                }
+                continue
+
+        return registry
+
+    def get_color(self, obj):
+        try:
+            if hasattr(obj, "ViewObject") and hasattr(obj.ViewObject, "ShapeColor"):
+                c = obj.ViewObject.ShapeColor
+                return [float(c[0]), float(c[1]), float(c[2])]
+        except:
+            pass
+        return [0.8, 0.8, 0.8]
+
+    def get_or_create_ai_registry(self):
+        doc = FreeCAD.ActiveDocument
+
+        if not doc:
+            FreeCAD.newDocument()
+            doc = FreeCAD.ActiveDocument
+
+        reg = doc.getObject("AI_Registry")
+        if reg:
+            return reg
+
+        reg = doc.addObject("App::FeaturePython", "AI_Registry")
+        reg.addProperty("App::PropertyString", "JSON", "AI", "Semantic registry")
+        reg.ViewObject.Visibility = False
+        reg.JSON = "{}"
+
+        return reg
+
+    def build_system_message(self):
+        registry_json = json.dumps(self.build_semantic_graph(), indent=2)
+        self.last_user_registry = registry_json
+
+        system_message = (
+            "You are a FreeCAD CAD assistant. Follow these rules:\n\n"
+            "1. OBJECT REGISTRY (SOURCE OF TRUTH):\n"
+            "```json\n" + registry_json + "\n```" + "\n\n"
+            "2. OBJECT HANDLING RULES:\n"
+            "   - ALWAYS get existing objects first: obj = App.activeDocument().getObject('Name')\n"
+            "   - Only create new objects if getObject returns None\n"
+            "   - When modifying properties, preserve other properties unless explicitly asked to change them\n"
+            "   - For colors, always use float values (0.0 to 1.0): obj.ViewObject.ShapeColor = (r, g, b)\n"
+            "   - Position objects using: obj.Placement = App.Placement(App.Vector(x, y, z), App.Rotation())\n"
+            "   - For sphere/cylinder diameter, set the Radius property to diameter/2\n\n"
+            "3. COLOR VALUES:\n"
+            "   Red = (1.0, 0.0, 0.0)\n"
+            "   Green = (0.0, 1.0, 0.0)\n"
+            "   Blue = (0.0, 0.0, 1.0)\n\n"
+            "4. CODE STYLE:\n"
+            "   - Include proper error checking\n"
+            "   - Use clear variable names\n"
+            "   - Maintain existing object properties unless asked to change them\n"
+            "   - When code is returned, end with: App.activeDocument().recompute()\n\n"
+            "5. IMPORTANT:\n"
+            "   - If the user asks a question, gives feedback, or asks for advice you MUST answer in plain text and DO NOT produce any Python code.\n"
+            "   - Preserve existing objects and their properties\n"
+            "   - Only create new objects if they don't exist\n"
+            "   - Use exact float values for colors (0.0 instead of 0)\n"
+            "   - Maintain relative positions when modifying objects\n\n"
+            "6. OBJECT IDENTITY RULES:\n"
+            "   - The JSON registry above is authoritative.\n"
+            "   - You MUST reference objects only by the keys in the registry.\n"
+            "   - You MUST NOT invent object names.\n"
+            "   - If an object is not in the registry, only then may you create it.\n"
+            '   - To modify an object, you MUST fetch it using: obj = App.ActiveDocument.getObject("ExactNameFromRegistry")\n\n'
+            "7. OUTPUT FORMAT RULE:\n"
+            "   - All executable code MUST be returned inside a fenced block exactly like this:\n"
+            "```python\n"
+            "# python here\n"
+            "```\n"
+            "Do not place any code outside the fenced block.\n\n"
+        )
+        return system_message
+
+    def colorize_json(self, pretty_json):
+        # Input MUST be already pretty-printed JSON text
+        html = self.html_escape(pretty_json)
+
+        # Keys
+        html = re.sub(
+            r"&quot;([^&]+)&quot;(?=\s*:)",
+            r'<span style="color:#9CDCFE;">"\1"</span>',
+            html,
+        )
+
+        # String values
+        html = re.sub(
+            r":\s*&quot;([^&]+)&quot;",
+            r': <span style="color:#CE9178;">"\1"</span>',
+            html,
+        )
+
+        # Numbers (int, float, negative)
+        html = re.sub(
+            r"(:\s*)(-?\d+(\.\d+)?)", r'\1<span style="color:#B5CEA8;">\2</span>', html
+        )
+
+        # Booleans + null
+        html = re.sub(
+            r"\b(true|false|null)\b", r'<span style="color:#569CD6;">\1</span>', html
+        )
+
+        # Structural characters
+        html = re.sub(r"([{}\[\]])", r'<span style="color:#D4D4D4;">\1</span>', html)
+
+        return html.replace("\n", "<br>").replace("  ", "&nbsp;&nbsp;")
+
+    def send_message(self):
+        user_input = self.chat_input.toPlainText().strip()
+
+        if not user_input:
+            return
+
+        system_message = self.build_system_message()
+
+        self.message_history.append(user_input)
+        self.append_chat("User", user_input)
+        self.chat_input.clear()
+
+        self.worker = OpenAIWorker(system_message, user_input, self.reference_image)
+        self.worker.result_ready.connect(self.on_ai_response)
+        self.worker.error.connect(self.on_ai_error)
+        self.worker.start()
+
+        # show spinner
+        self.spinner_label.setVisible(True)
+        self._spinner_index = -1
+        self._spinner_timer.start(self.active_spinner_interval)
+
+        self.chat_input.clear()
+
+    def extract_code_block(self, text):
+        m = CODE_BLOCK.search(text)
+        if not m:
+            return None, None
+
+        code = m.group(1).strip()
+        start, end = m.span()
+        return code, (start, end)
+
+    def looks_like_command(self, text):
+        verbs = [
+            "add",
+            "create",
+            "make",
+            "move",
+            "resize",
+            "delete",
+            "change",
+            "color",
+            "rotate",
+            "scale",
+        ]
+        t = text.lower()
+        return any(v in t for v in verbs)
+
+    def is_boolean(self, obj):
+        return obj.TypeId in (
+            "Part::Cut",
+            "Part::Fuse",
+            "Part::Common",
+            "Part::MultiFuse",
+            "Part::Compound",
+            "PartDesign::Boolean",
+        )
+
+    def is_solid_feature(self, obj):
+        return (
+            obj.TypeId in ("Part::Feature", "PartDesign::Body", "App::Link")
+            and hasattr(obj, "Shape")
+            and not obj.Shape.isNull()
+        )
+
+    def is_history_node(self, obj):
+        return obj.TypeId.startswith("PartDesign::") and obj.TypeId not in (
+            "PartDesign::Body",
+            "PartDesign::Boolean",
+        )
+
+    def persist_registry(self):
+        reg = self.get_or_create_ai_registry()
+        graph = self.build_semantic_graph()
+        try:
+            reg.JSON = json.dumps(graph, indent=2)
+        except Exception as e:
+            reg.JSON = "{}"
+
+    def get_global_position(self, obj):
+        try:
+            p = obj.getGlobalPlacement().Base
+            return [float(p.x), float(p.y), float(p.z)]
+        except:
+            try:
+                p = obj.Placement.Base
+                return [float(p.x), float(p.y), float(p.z)]
+            except:
+                return [0.0, 0.0, 0.0]
+
+    def on_ai_response(self, response_text):
+        self._spinner_timer.stop()
+        self.spinner_label.setVisible(False)
+        self.message_history.append(response_text)
+
+        code, span = self.extract_code_block(response_text)
+        if not code:
+            self.append_chat("AI", response_text)
+
+            return
+
+        self.ai_step_counter += 1
+        step_id = self.ai_step_counter
+        transaction_name = f"AI Step {step_id}"
+
+        # store everything
+        self.ai_steps.append((step_id, response_text, code, transaction_name))
+
+        # display the FULL message (including fenced code)
+        self.append_chat("AI", response_text, step_id)
+
+        self.clear_image()
+        self.persist_registry()
+        self.execute_code(code, transaction_name)
+
+    def on_ai_error(self, error_text):
+        self._spinner_timer.stop()
+        self.spinner_label.setVisible(False)
+        self.append_chat("Error", error_text)
+
+    def execute_code(self, code, transaction_name):
+        doc = FreeCAD.ActiveDocument
+
+        if doc is None:
+            FreeCAD.newDocument()
+            doc = FreeCAD.ActiveDocument
+
+        try:
+            doc.openTransaction(transaction_name)
+
+            global_env = {
+                "App": FreeCAD,
+                "Gui": FreeCADGui,
+                "Part": Part,
+                "FreeCAD": FreeCAD,
+                "FreeCADGui": FreeCADGui,
+            }
+
+            exec(code, global_env)
+            doc.recompute()
+            doc.commitTransaction()
+
+            self.append_chat("AI", f"{transaction_name} applied")
+            self.persist_registry()
+
+        except Exception as e:
+            doc.abortTransaction()
+            self.append_chat("Error", str(e))
+
+
+# Create and add the dock widget if it doesn't exist
+if not FreeCADGui.getMainWindow().findChild(QtGui.QDockWidget, "Copilot Chat"):
+    chat_dock = ChatDock(FreeCADGui.getMainWindow())
+    FreeCADGui.getMainWindow().addDockWidget(QtCore.Qt.RightDockWidgetArea, chat_dock)

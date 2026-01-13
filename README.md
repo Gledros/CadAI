@@ -1,3 +1,6 @@
+# BASED on Artifex by Izzy
+[https://github.com/islamnurdin/Artifex](https://github.com/islamnurdin/Artifex)
+
 # Artifex: AI-Powered Text-to-CAD Tool 🚀
 
 [![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
